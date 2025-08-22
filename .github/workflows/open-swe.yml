@@ -1,0 +1,176 @@
+name: Open SWE Agent Workflow
+
+env:
+  # hostname of the docker registry to push to
+  DOCKER_REGISTRY: 947577070829.dkr.ecr.us-west-2.amazonaws.com
+
+  # name of the docker repository (without -agent suffix as per ECR requirements)
+  DOCKER_REPO: wiser/open-swe
+
+  # location of the dockerfile for this specific application
+  APP_BASE_PATH: apps/open-swe
+  DOCKERFILE_PATH: apps/open-swe/Dockerfile
+
+  # location of the GitOps repo on GitHub
+  GITOPS_REPO: WiserSolutions/k8s-data
+  GITOPS_REPO_PATH: values/open-swe-app/open-swe-agent-test-use1.yaml
+  GITOPS_FIELD: 0.image.tag
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'apps/open-swe/**'
+      - '.github/workflows/open-swe.yml'
+    tags:
+      - 'v*'    # Match semantic version tags (v1.0.0, v2.1.3, etc.)
+  workflow_dispatch: null
+
+jobs:
+  lint:
+    name: Lint Code
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.APP_BASE_PATH }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'yarn'
+          cache-dependency-path: ${{ env.APP_BASE_PATH }}/yarn.lock
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+      - name: Run ESLint
+        run: yarn lint
+      - name: Check formatting
+        run: yarn format:check
+
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.APP_BASE_PATH }}
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'yarn'
+          cache-dependency-path: ${{ env.APP_BASE_PATH }}/yarn.lock
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Run unit tests
+        run: yarn test
+
+      - name: Build application
+        run: yarn build
+
+  security_scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: test
+    defaults:
+      run:
+        working-directory: ${{ env.APP_BASE_PATH }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'yarn'
+          cache-dependency-path: ${{ env.APP_BASE_PATH }}/yarn.lock
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+      - name: Run yarn audit
+        run: yarn audit --level high
+
+  package:
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+    name: Build Docker
+    runs-on: ubuntu-latest
+    needs: [test, security_scan]
+    outputs:
+      tag: ${{ env.TAG }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set Env
+        run: |
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            echo "TAG=$(echo ${GITHUB_REF#refs/tags/} | sed 's/^v//')" >> $GITHUB_ENV
+            echo "RELEASE_TAG=prod-latest" >> $GITHUB_ENV
+          else
+            echo "TAG=$(git show -s --format=%cd-%h --date=format:%Y%m%d%H%S)" >> $GITHUB_ENV
+            echo "RELEASE_TAG=test-latest" >> $GITHUB_ENV
+          fi
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          # Add APP_BASE_PATH to cache key if different apps have different base dependencies often
+          key: ${{ runner.os }}-buildx-${{ env.APP_BASE_PATH }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-${{ env.APP_BASE_PATH }}-
+
+      - name: Login to ECR Wiser Registry
+        uses: WiserSolutions/login-action@master
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: AWS
+          password: ${{ secrets.ECR_DOCKER_PASSWORD }}
+          isECR: 'false'
+
+      - name: Build and push
+        id: docker_build
+        uses: docker/build-push-action@v4
+        with:
+          context: ${{ env.APP_BASE_PATH }}  # Limit context to agent app directory
+          file: ${{ env.DOCKERFILE_PATH }}  # Path to Dockerfile relative to repo root
+          push: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            TAG=${{ env.TAG }}
+            GIT_SHA=${{ github.sha }}
+            GIT_RUN_NUMBER=${{ github.run_number }}
+          tags: |
+            ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REPO }}:${{ env.TAG }}-agent-${{ github.run_number }}
+            ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REPO }}:${{ env.RELEASE_TAG }}-agent-${{ github.run_number }}
+            ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REPO }}:${{ env.TAG }}-agent
+            ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REPO }}:${{ env.RELEASE_TAG }}-agent
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image digest
+        run: |
+          echo 'Image Tag: ${{ env.TAG }}-agent-${{ github.run_number }}'
+
+  deployTest:
+    name: Deploy Test
+    runs-on: ubuntu-latest
+    needs: ['package']
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: WiserSolutions/gitops-deploy@master
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          ref: refs/heads/main
+          path: ${{ env.GITOPS_REPO_PATH }}
+          token: ${{ secrets.WISER_CI_TOKEN }}
+          field: ${{ env.GITOPS_FIELD }}
+          new-version: ${{ needs.package.outputs.tag }}-agent-${{ github.run_number }}
