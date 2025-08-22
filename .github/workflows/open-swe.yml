@@ -36,6 +36,8 @@ jobs:
         working-directory: ${{ env.APP_BASE_PATH }}
     steps:
       - uses: actions/checkout@v4
+      - name: Enable Corepack
+        run: corepack enable
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -58,6 +60,9 @@ jobs:
     needs: lint
     steps:
       - uses: actions/checkout@v4
+
+      - name: Enable Corepack
+        run: corepack enable
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -84,6 +89,8 @@ jobs:
         working-directory: ${{ env.APP_BASE_PATH }}
     steps:
       - uses: actions/checkout@v4
+      - name: Enable Corepack
+        run: corepack enable
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
